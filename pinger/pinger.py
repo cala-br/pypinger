@@ -13,469 +13,293 @@ import socket
 from socket import \
     socket as Socket, AF_INET, SOCK_RAW
 
-
-class PingStatus:
-    SUCCESS = True
-    FAILURE = False
+from pinger.ping_result import PingResult, PingStatus
+from pinger.ping_wait_handle import PingWaitHandle
 
 
-#region Ping result
-@dataclass
-class PingResult:
-
-    # The status of the ping.
-    # Either SUCCESS or FAILURE
-    status : PingStatus = \
-        field(default = PingStatus.FAILURE)
-
-    # The target's hostname.
-    hostname : str = field(default = None)
-
-    # The address of the host that
-    # received the ping.
-    remoteAddress : str = field(default = None)
-
-    # The ID of this ping
-    packetId : int = field(default = -1)
-
-    # The ping's delay.
-    # Its value will be math.inf if
-    # the ping received no pong.
-    delay : int = field(default = math.inf)
-#endregion
-
-
-#region Ping wait handle
-class PingWaitHandle(Event):
-    """
-    An event that can be waited.
-    It carries a ping result.
-    """
-
-    def __init__(
-        self, 
-        defaultResult : PingResult):
-        """
-        Creates a new PingWaitHandle
-
-        Parameters
-        ----------
-            defaultResult : PingResult
-                The default result for the ping.
-        """
-        super().__init__()
-        self.result = defaultResult
-#endregion
-
-
-#region Pinger
 class Pinger:
+  ICMP_ECHO_REQUEST = 8
+  BYTES_IN_DOUBLE   = struct.calcsize("d")
 
-    #region Constants
+  _socket     : Socket = None
+  _currentId  : int    = 0
+  _pingsQueue : Queue  = Queue()
+  _pings : \
+    Dict[int, PingWaitHandle] = {}
 
-    ICMP_ECHO_REQUEST = 8
-    BYTES_IN_DOUBLE   = struct.calcsize("d")
-
-    #endregion
-
-    #region Static fields
-
-    _socket     : Socket = None
-    _currentId  : int    = 0
-    _pingsQueue : Queue  = Queue()
-    _pings : \
-        Dict[int, PingWaitHandle] = {}
-
-    _pingingThread : Thread = None
-    _pongingThread : Thread = None
-
-    #endregion
-
-    #region Get id
-    @staticmethod 
-    def _getId() -> int:
-        """
-        Returns
-        -------
-            int
-                The current ping ID
-        """
-        Pinger._currentId += 1
-        return Pinger._currentId
-    #endregion
+  _pingingThread : Thread = None
+  _pongingThread : Thread = None
 
 
-    #region Try init socket
-    @staticmethod
-    def _tryInitSocket() -> None:
-        """
-        Initializes the underlying ping socket,
-        if not already initialized.
-        """
-        if not Pinger._socket:
-            Pinger._socket = Socket(
-                AF_INET, 
-                SOCK_RAW, 
-                socket.getprotobyname('icmp'))
+  @staticmethod 
+  def _getId() -> int:
+    Pinger._currentId += 1
+    return Pinger._currentId
 
-            Pinger._socket.setblocking(False)
-    #endregion
 
-    #region Compute checksum
-    @staticmethod
-    def computeChecksum(payload : str) -> int:
-        """
-        Computes the checksum over a payload.
+  @staticmethod
+  def _tryInitSocket() -> None:
+    """
+    Initializes the underlying ping socket,
+    if not already initialized.
+    """
+    if not Pinger._socket:
+      Pinger._socket = Socket(
+        AF_INET, 
+        SOCK_RAW, 
+        socket.getprotobyname('icmp')
+      )
 
-        Parameters
-        ----------
-            payload : str
-                
-        Returns
-        -------
-            int
-                The computed checksum.
-        """
-        sum = 0
-        maxCount = (len(payload) / 2) * 2
-        count = 0
-        while count < maxCount:
-            val = \
-                payload[count + 1] * 256 + payload[count]
+      Pinger._socket.setblocking(False)
 
-            sum = sum + val
-            sum = sum & 0xffffffff 
-            count = count + 2
-     
-        if maxCount < len(payload):
-            sum = sum + ord(payload[len(payload) - 1])
-            sum = sum & 0xffffffff 
-     
-        sum = (sum >> 16)  +  (sum & 0xffff)
-        sum = sum + (sum >> 16)
-        result = ~sum
-        result = result & 0xffff
-        result = result >> 8 | (result << 8 & 0xff00)
-        return result
-    #endregion
 
-    #region Build packet
-    @staticmethod
-    def _buildPacket(packetId : int) -> bytes:
-        # Create a dummy header with a 0 checksum.
-        header = struct.pack(
-            "bbHHh", 
-            Pinger.ICMP_ECHO_REQUEST, 
-            0, 0, 
-            packetId, 1)
+  @staticmethod
+  def _buildPacket(packetId: int) -> bytes:
+    header = \
+      Pinger._getHeaderWithChecksum(packetId, checksum = 0)
+    
+    data = "abcdefghijklmnopqrstuvwxyz"
+    data = struct.pack("d", time.time()) + bytes(data.encode('utf-8'))
 
-        data = "abcdefghijklmnopqrstuvwxyz"
-        data = struct.pack("d", time.time()) + bytes(data.encode('utf-8'))
-     
-        # Get the checksum on the data and the dummy header.
-        checksum = \
-            Pinger.computeChecksum(header + data)
+    checksum = \
+      Pinger.computeChecksum(header + data)
 
-        header = struct.pack(
-            "bbHHh", 
-            Pinger.ICMP_ECHO_REQUEST, 
-            0, 
-            socket.htons(checksum), 
-            packetId, 1)
-            
-        packet = header + data
-        return packet
-    #endregion
+    header = \
+      Pinger._getHeaderWithChecksum(packetId, socket.htons(checksum))
+    
+    packet = header + data
+    return packet
 
-    #region Try resolve hostname
-    @staticmethod
-    def tryResolveHostname(host : str) -> str:
-        """
-        Tries to resolve an hostname.
+  @staticmethod
+  def computeChecksum(payload : str) -> int:
+    sum = 0
+    maxCount = (len(payload) / 2) * 2
+    count = 0
+    while count < maxCount:
+      val = \
+        payload[count + 1] * 256 + payload[count]
 
-        Parameters
-        ----------
-            host : str
-                The hostname that has to be resolved.
+      sum = sum + val
+      sum = sum & 0xffffffff 
+      count = count + 2
 
-        Returns
-        -------
-            str or None
-                A string with the resolved IPAddress
-                or None if the resolution failed.
-        """
+    if maxCount < len(payload):
+      sum = sum + ord(payload[len(payload) - 1])
+      sum = sum & 0xffffffff 
+
+    sum = (sum >> 16)  +  (sum & 0xffff)
+    sum = sum + (sum >> 16)
+    result = ~sum
+    result = result & 0xffff
+    result = result >> 8 | (result << 8 & 0xff00)
+
+    return result
+
+  @staticmethod
+  def _getHeaderWithChecksum(packetId: int, checksum: int) -> bytes:
+    return struct.pack(
+      "bbHHh", 
+      Pinger.ICMP_ECHO_REQUEST, 
+      0, 
+      checksum, 
+      packetId, 1
+    )
+
+
+  @staticmethod
+  def tryResolveHostname(host : str) -> Union[str, None]:
+    """
+    Returns
+    -------
+      str or None
+        A string with the resolved IPAddress
+        or None if the resolution failed.
+    """
+    try:
+      return socket.gethostbyname(host)
+    except:
+      return None
+
+
+  @staticmethod
+  def ping(
+    host    : str, 
+    timeout : float = None,
+    resolve : bool  = True) -> PingResult:
+    """
+    Parameters
+    ----------
+      timeout : float = None
+        The ping's timeout, in seconds.
+        Leave None to wait indefinetely.
+
+      resolve : bool = True
+        Tells whether the host name should 
+        be resolved via DNS or not.
+    """
+    Pinger._tryStartLoops()
+
+    packetId  = Pinger._getId()
+    badResult = PingResult(
+      hostname = host,
+      remoteAddress = host, 
+      packetId = packetId
+    )
+
+    if resolve:
+      host = Pinger.tryResolveHostname(host)
+    
+    if host is None:
+      return badResult
+
+    Pinger._schedulePing(host, packetId)
+    pingWH = \
+      PingWaitHandle(badResult)
+
+    # Setting the event and default result
+    Pinger._pings[packetId] = pingWH
+
+    # Waiting for the result
+    pingWH.wait(timeout)
+    result = pingWH.result
+
+    del Pinger._pings[packetId]
+    return result
+
+  @staticmethod
+  def _schedulePing(host: str, packetId: int):
+    Pinger \
+      ._pingsQueue \
+      .put((host, packetId))
+
+
+  @staticmethod
+  async def pingAsync(
+    host: str, 
+    timeout: float = None, 
+    resolve: bool = True
+  ) -> PingResult:
+    return Pinger.ping(host, timeout, resolve)
+
+
+  @staticmethod
+  def pingAll(
+    hosts: List[str], 
+    timeout: float = None, 
+    resolve: bool = True
+  ) -> List[PingResult]:
+    return [
+      Pinger.ping(host, timeout, resolve)
+      for host in hosts
+    ]
+
+
+  @staticmethod
+  async def pingAllAsync(
+    hosts: List[str], 
+    timeout: float = None, 
+    resolve: bool = True
+  ) -> List[PingResult]:
+    pings = [
+      Pinger.pingAsync(host, timeout, resolve)
+      for host in hosts
+    ]
+
+    return await asyncio.gather(*pings)
+
+
+  @staticmethod
+  def _pingingLoop() -> None:
+    """
+    Takes care of pinging the hosts.
+    It is run asynchronously inside a thread.
+    """
+    pq = Pinger._pingsQueue
+    sock = Pinger._socket 
+
+    # pylint: disable=not-context-manager
+    with sock:
+      while True:
         try:
-            return \
-                socket.gethostbyname(host)
+          address, packetId = pq.get(True)
+          payload = Pinger._buildPacket(packetId)
+
+          sock.sendto(payload, (address, 0))
+        except Exception:
+          pass
+
+
+  @staticmethod
+  def _pongingLoop() -> None:
+    """
+    Takes care of receiving the pongs.
+    It is run asynchronously inside a thread.
+    """
+    sock = Pinger._socket
+
+    # pylint: disable=not-context-manager
+    with sock:
+      while True:
+        try:
+          payload, addr = sock.recvfrom(256)
         except:
-            # Error when getting address
-            # info
-            return None
-    #endregion
-
-    
-    #region Ping
-    @staticmethod
-    def ping(
-        host    : str, 
-        timeout : float = None,
-        resolve : bool  = True) -> PingResult:
-        """
-        Executes the ping.
-
-        Parameters
-        ----------
-            host : str
-                The host to ping
-
-            timeout : float = None
-                The ping's timeout, in seconds.
-                Leave None to wait indefinetely.
-
-            resolve : bool = True
-                Tells whether the host name should 
-                be resolved via DNS or not.
-
-        Returns
-        -------
-            PingResult
-                An object containing the ping
-                result informations.
-        """
-        Pinger._tryStartLoops()
-
-        packetId  = Pinger._getId()
-        badResult = PingResult(
-            hostname      = host,
-            remoteAddress = host, 
-            packetId      = packetId)
-
+          # Non-blocking sockets raise
+          # exceptions if no data is in the buffer.
+          continue
         
-        if resolve:
-            host = \
-                Pinger.tryResolveHostname(host)
+        endTime = time.time()
+        header = payload[20:28]
+
+        _, _, _,  \
+        packetId, \
+        _ =       \
+          struct.unpack("bbHHh", header)
         
-        if host is None:
-            return badResult
+        roundTripTime = \
+          struct.unpack("d", payload[28:28 + Pinger.BYTES_IN_DOUBLE])[0]
 
-        # Scheduling the ping
-        Pinger \
-            ._pingsQueue \
-            .put((host, packetId))
+        # If the ping was deregistered
+        # due to timeout
+        if not packetId in Pinger._pings:
+          continue
 
-        pingWH = \
-            PingWaitHandle(badResult)
+        pingWH = Pinger._pings[packetId]
 
-        # Setting the event and default result
-        Pinger._pings[packetId] = pingWH
+        # Setting the ping result
+        pingWH.result = PingResult(
+          hostname = pingWH.result.hostname,
+          remoteAddress = addr[0],
+          status = PingStatus.SUCCESS,
+          packetId = packetId,
+          delay = endTime - roundTripTime
+        )
+        
+        # Setting the ping wait handle,
+        # in order for it to complete
+        pingWH.set()
 
-        # Waiting for the result
-        pingWH.wait(timeout)
-        result = pingWH.result
 
-        del Pinger._pings[packetId]
+  @staticmethod 
+  def _tryStartLoops():
+    """
+    Starts the pinging and ponging loops, 
+    if not done already.
+    """
+    if not Pinger._pingingThread:
+      Pinger._tryInitSocket()
+
+      def startThread(name, callback):
+        result = Thread(
+          name = name,
+          target = callback,
+          daemon = True
+        )
+
+        result.start()
         return result
-    #endregion
 
-    #region Ping async
-    @staticmethod
-    async def pingAsync(
-        host    : str, 
-        timeout : float = None, 
-        resolve : bool  = True) -> PingResult:
-        """
-        Executes the ping asynchronously.
-
-        Parameters
-        ----------
-            host : str
-                The host to ping
-
-            timeout : float = 5
-                The ping's timeout, in seconds.
-
-            resolve : bool = True
-                Tells whether the host name should 
-                be resolved via DNS or not.
-
-        Returns
-        -------
-            PingResult
-                An object containing the ping
-                result informations.
-        """
-        return Pinger.ping(host, timeout, resolve)
-    #endregion
-
-    #region Ping all 
-    @staticmethod
-    def pingAll(
-        hosts   : List[str], 
-        timeout : float = None, 
-        resolve : bool  = True) -> List[PingResult]:
-        """
-        Pings all the hosts in a list.
-
-        Parameters
-        ----------
-            hosts : List[str]
-                The hosts to ping.
-            
-            timeout : float = 5
-                The timeout for each host.
-                Doesn't take into account DNS resolution.
-
-            resolve : bool = True
-                Tells whether to resolve the hostname or not.
-
-        Returns
-        -------
-            List[PingResult]
-                The ping results
-        """
-        return [
-            Pinger.ping(host, timeout, resolve)
-            for host in hosts
-        ]
-    #endregion
-
-    #region Ping all async
-    @staticmethod
-    async def pingAllAsync(
-        hosts   : List[str], 
-        timeout : float = None, 
-        resolve : bool  = True) -> List[PingResult]:
-        """
-        Pings all the hosts in a list asynchronously.
-
-        Parameters
-        ----------
-            hosts : List[str]
-                The hosts to ping.
-            
-            timeout : float = 5
-                The timeout for each host.
-                Doesn't take into account DNS resolution.
-
-            resolve : bool = True
-                Tells whether to resolve the hostname or not.
-
-        Returns
-        -------
-            List[PingResult]
-                The ping results, wrapped in an 
-                awaitable object.
-        """
-        pings = [
-            Pinger.pingAsync(host, timeout, resolve)
-            for host in hosts
-        ]
-
-        return await \
-            asyncio.gather(*pings)
-    #endregion
-
-    
-    #region Pinging loop
-    @staticmethod
-    def _pingingLoop() -> None:
-        """
-        Takes care of pinging the hosts.
-        It is run asynchronously inside a thread.
-        """
-        pq   = Pinger._pingsQueue
-        sock = Pinger._socket 
-
-        # pylint: disable=not-context-manager
-        with sock:
-            while True:
-                try:
-                    address, packetId = pq.get(True)
-
-                    payload = \
-                        Pinger._buildPacket(packetId)
-
-                    sock.sendto(payload, (address, 0))
-
-                except Exception:
-                    pass
-    #endregion
-
-    #region Ponging loop
-    @staticmethod
-    def _pongingLoop() -> None:
-        """
-        Takes care of receiving the pongs.
-        It is run asynchronously inside a thread.
-        """
-        sock = Pinger._socket
-
-        # pylint: disable=not-context-manager
-        with sock:
-            while True:
-                try:
-                    payload, addr = sock.recvfrom(256)
-                except:
-                    # Non-blocking sockets raise
-                    # exceptions if no data is in the buffer.
-                    continue
-                
-                endTime = time.time()
-                header  = payload[20:28]
-
-                _, _, _,    \
-                packetId,   \
-                _ =         \
-                    struct.unpack("bbHHh", header)
-                
-                roundTripTime = \
-                    struct.unpack("d", payload[28:28 + Pinger.BYTES_IN_DOUBLE])[0]
-
-                # If the ping was deregistered
-                # due to timeout
-                if not packetId in Pinger._pings:
-                    continue
-
-                pingWH = Pinger._pings[packetId]
-
-                # Setting the ping result
-                pingWH.result = PingResult(
-                    hostname      = pingWH.result.hostname,
-                    remoteAddress = addr[0],
-                    status        = PingStatus.SUCCESS,
-                    packetId      = packetId,
-                    delay         = endTime - roundTripTime)
-                
-                # Setting the ping wait handle,
-                # in order for it to complete
-                pingWH.set()
-    #endregion
-
-    #region Try start loops
-    @staticmethod 
-    def _tryStartLoops():
-        """
-        Starts the pinging and ponging loops, 
-        if not done already.
-        """
-        if not Pinger._pingingThread:
-            Pinger._tryInitSocket()
-
-            Pinger._pingingThread = Thread(
-                name   = 'pinging-thread',
-                target = Pinger._pingingLoop,
-                daemon = True)
-
-            Pinger._pongingThread = Thread(
-                name   = 'ponging-thread',
-                target = Pinger._pongingLoop,
-                daemon = True)
-
-            Pinger._pingingThread.start()
-            Pinger._pongingThread.start()
-    #endregion
-
-#endregion
+      Pinger._pingingThread = startThread('pinging-thread', Pinger._pingingLoop)
+      Pinger._pongingThread = startThread('ponging-thread', Pinger._pongingLoop)
 
 
 #region Main
@@ -597,13 +421,13 @@ async def main():
 
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-        
-    except OSError as e:
-        if e.errno == 1:
-            print("You must be a root user to run this script.")
-        
-        exit(1)
-    except:
-        exit(0)
+  try:
+    asyncio.run(main())
+      
+  except OSError as e:
+    if e.errno == 1:
+      print("You must be a root user to run this script.")
+      
+    exit(1)
+  except:
+    exit(0)
